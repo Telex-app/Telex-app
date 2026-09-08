@@ -9,6 +9,14 @@
   Telex gives a phone number a Stellar wallet and drives it from a chat conversation,<br/>so people can be paid on the number their contacts already have for them.
 </p>
 
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
+  <a href=".nvmrc"><img src="https://img.shields.io/badge/node-20-green.svg" alt="Node 20" /></a>
+  <img src="https://img.shields.io/badge/blockchain-Stellar-blueviolet.svg" alt="Stellar" />
+  <a href="https://github.com/Telex-app/Telex-app/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" /></a>
+  <img src="https://img.shields.io/badge/status-pre--production-orange.svg" alt="Status: Pre-production" />
+</p>
+
 No app to install, no seed phrase, no wallet address. Type your intent, confirm with a PIN, and the payment settles on Stellar.
 
 > **Status: pre-production.** The architecture, compliance model and transport layer are built and tested. Real money movement still needs provider credentials, a KYC integration, monitoring, and compliance review. See [Before a real-money launch](#before-a-real-money-launch).
