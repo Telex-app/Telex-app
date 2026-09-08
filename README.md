@@ -239,5 +239,3 @@ Already in place:
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
-#   T e l e x - a p p  
- 
