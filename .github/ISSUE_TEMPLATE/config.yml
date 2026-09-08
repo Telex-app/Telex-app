@@ -1,0 +1,6 @@
+blank_issues_enabled: false
+# A private security-reporting link belongs here once the repository exists:
+#   contact_links:
+#     - name: Security vulnerability
+#       url: https://github.com/<owner>/<repo>/security/advisories/new
+#       about: Please report security issues privately, not as a public issue.

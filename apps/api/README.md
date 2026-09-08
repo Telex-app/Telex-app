@@ -1,0 +1,485 @@
+# Telex API
+
+Express backend for the new Telex architecture: WhatsApp conversational payments, direct-custody wallets, payment orchestration, compliance, voice transcription, pricing, queues, and admin monitoring.
+
+## Architecture
+
+The backend routes work through these modules:
+
+```text
+src/
+  whatsapp/      Conversational assistant
+  wallet/        Stellar adapter + WalletService abstraction
+  payment/       Payment Orchestrator
+  compliance/    KYC tiers, PIN, risk, limits
+  voice/         Voice note download + transcription
+  pricing/       FX and fee quotes
+  queues/        BullMQ queue helpers
+  jobs/          Background processors
+  common/        Shared audit helpers
+```
+
+## Payment Rail
+
+- All payments settle on Stellar.
+- Destinations are Stellar `G...` StrKey addresses; users never see rail mechanics — the Payment Orchestrator records everything internally.
+
+## Wallets
+
+`src/wallet/wallet.service.js` is the only backend surface that should talk to the Stellar adapter (`stellar.adapter.js`). Direct custody: the adapter generates a keypair, and the private key is encrypted (AES-256-GCM, `services/crypto.service.js`) before being stored — one `Wallet` row per user.
+
+## Queues
+
+WhatsApp webhooks return `200` immediately, then enqueue work through BullMQ when Redis is configured. In local development without Redis, jobs run through an inline fallback.
+
+## Environment
+
+Use `.env.example`. The main provider keys are:
+
+```text
+REDIS_URL=
+DEEPGRAM_API_KEY=
+SMILE_ID_PARTNER_ID=
+SMILE_ID_API_KEY=
+EXCHANGERATE_API_KEY=
+```
+
+## Tech Stack
+
+- Node.js
+- Express
+- PostgreSQL (Neon) with Prisma
+- `@stellar/stellar-sdk`
+- WhatsApp Business Cloud API
+- BullMQ / Redis
+- Axios
+- Helmet, CORS, Morgan
+- PostgreSQL-backed rate limiting (`express-rate-limit` + a custom shared store)
+- `node:test` for the test suite
+
+## Folder Structure
+
+```text
+apps/api/
+  src/
+    config/        Environment and database configuration
+    controllers/   Webhook, wallet, and admin request handlers
+    whatsapp/      Conversational assistant
+    wallet/        Stellar adapter + WalletService abstraction
+    payment/       Payment Orchestrator
+    compliance/    KYC tiers, PIN, risk, limits
+    voice/         Voice note download + transcription
+    pricing/       FX and fee quotes
+    queues/        BullMQ queue helpers
+    jobs/          Background processors
+    middlewares/   Error handling, not-found, admin auth, webhook verify,
+                   WhatsApp signature verify, Postgres rate-limit store
+    routes/        Express route definitions
+    services/      WhatsApp, crypto, adminAuth, rateLimit services
+    common/        Prisma client, audit helpers, shared record utils
+    utils/         Response helpers, logger, validators
+    app.js         Express app setup (middleware, routes)
+    server.js      Database connection and server start
+  prisma/          Prisma schema and migrations
+  test/            node:test suites (crypto, admin auth, validators)
+```
+
+## Run
+
+## OpenAPI Specification (#161)
+
+Telex publishes a machine-readable OpenAPI 3.0 specification at `apps/api/openapi.json`.
+
+- **Spec Endpoint**: `GET /api/docs/openapi.json` (or `GET /api/docs`)
+- **CLI Validator**: `node scripts/validate-openapi.js`
+- **Test Suite**: `node --test test/openapi.test.js`
+
+To render locally with Swagger UI or Redoc:
+```bash
+npx @redocly/cli preview-docs openapi.json
+```
+
+## API Routes
+
+All JSON responses use a consistent envelope. Every response (header and body)
+carries a `correlationId` you can use to match a failure against server logs:
+
+```jsonc
+// success
+{ "success": true, "message": "…", "correlationId": "…", "data": { /* … */ } }
+// error
+{
+  "success": false,
+  "message": "…",
+  "correlationId": "…",
+  "error": {
+    "version": "1.0",        // error envelope version — bump = breaking shape change
+    "code": "validation_error", // stable machine-readable code — branch on this, never the message
+    "message": "…",
+    "correlationId": "…",
+    "details": { }           // optional, omitted when empty
+  }
+}
+```
+
+The error code catalog is `src/errors/catalog.js`. Core codes and their HTTP
+statuses:
+
+| code                | status | meaning                                  |
+| ------------------- | ------ | ---------------------------------------- |
+| `validation_error`  | 400    | malformed request / validation failure   |
+| `unauthorized`      | 401    | missing or invalid authentication        |
+| `forbidden`         | 403    | authenticated but not allowed            |
+| `not_found`         | 404    | resource does not exist                  |
+| `conflict`          | 409    | duplicate / state conflict (e.g. P2002)  |
+| `rate_limited`      | 429    | too many requests                        |
+| `provider_error`    | 502    | an upstream provider failed              |
+| `service_unavailable`| 503   | temporary unavailability                 |
+| `internal_error`    | 500    | unexpected — message is always generic   |
+
+Messages for `internal_error` are never sent verbatim (they can leak secrets or
+provider internals); the real error is only logged/reported. Throw
+`AppError` (`src/errors/AppError.js`) from controllers/services to carry a
+stable code and status, or set `error.statusCode` on a plain `Error` to map by
+status.
+
+### Health
+
+```text
+GET /health      Liveness/readiness probe (503 if the database link is down)
+```
+
+### WhatsApp Webhook
+
+```text
+GET  /webhook    Verification handshake (echoes hub.challenge)
+POST /webhook    Receives messages — X-Hub-Signature-256 verified first
+```
+
+### Admin Routes
+
+```text
+POST /api/admin/login          Exchange ADMIN_PASSWORD for a session token
+GET  /api/admin/stats          (requires Bearer token)
+GET  /api/admin/users          (requires Bearer token)
+GET  /api/admin/wallets        (requires Bearer token)
+GET  /api/admin/transactions   (requires Bearer token)
+GET  /api/admin/kyc            (requires Bearer token)
+GET  /api/admin/audit-logs     (requires Bearer token)
+GET  /api/admin/system-health  (requires Bearer token)
+```
+
+`POST /api/admin/login` takes `{ "password": "…" }` and returns `{ data: { token } }`. Send that token as `Authorization: Bearer <token>` on the other admin routes. The login endpoint is rate-limited (10 attempts / 15 min) on top of the global limiter.
+
+The list endpoints (`/users`, `/wallets`, `/transactions`) are paginated via `?page` (default 1) and `?limit` (default 50, max 100). `data` is the array of items; a `pagination` block (`{ page, limit, total, totalPages }`) is returned alongside.
+
+### Wallet Routes (optional, for testing without WhatsApp)
+
+```text
+POST /api/wallet/create        { phoneNumber }
+GET  /api/wallet/:phone/balance
+POST /api/wallet/send          { phoneNumber, amount, destination }
+```
+
+> ⚠️ These routes are **unauthenticated** — the phone number in the request body is the only identity. They are intended for local testing of the same wallet actions used by WhatsApp. They are **disabled in production by default**; set `ENABLE_WALLET_REST_API=true` to expose them (not recommended without adding per-user auth first). WhatsApp is the real, signature-verified product surface.
+
+### Compliance Self-Service Routes (optional, for testing without WhatsApp)
+
+```text
+POST /api/compliance/kyc/start   { phoneNumber, providerReference }
+POST /api/compliance/pin         { phoneNumber, pin }
+```
+
+> ⚠️ Same story as the wallet routes above — no per-user identity check, gated behind the same `ENABLE_WALLET_REST_API` flag (`middlewares/requireRestApiEnabled`), and disabled in production by default. `GET /api/compliance/kyc/:phone` and `POST /api/compliance/kyc/:id/review` are different: those require an admin Bearer token and are always on.
+
+### Chat Simulator Routes (optional, for testing without WhatsApp)
+
+```text
+POST /api/sim/message           { phoneNumber, name?, text }   -> { replies: ["…"] }
+GET  /api/sim/messages/:phone?since=<ISO date>                 -> { messages: [{ direction, text, createdAt }] }
+```
+
+Runs the same `processMessage` pipeline the WhatsApp webhook uses and returns its replies directly in the response instead of sending them through Meta, so a chat client can drive the bot without a WhatsApp number.
+
+> ⚠️ Same story as the wallet and compliance routes above — no per-user identity check, gated behind `ENABLE_WALLET_REST_API`, and disabled in production by default. The conversation history is currently held in an **in-process memory store** (not persisted, not shared across instances) as a stand-in for the `SimMessage` table + store service tracked in issues #8/#9 — swap it out once those land.
+
+## Environment Variables
+
+Create an `.env` file in `apps/api` using `.env.example` as a guide. The app **fails fast at startup** if the required secrets are missing or weak.
+
+```env
+PORT=3002
+NODE_ENV=development
+MONGODB_URI=mongodb://localhost:27017/telex
+
+# REST API CORS allowlist (comma-separated). Required in production.
+CORS_ORIGINS=http://localhost:3000,http://localhost:3001
+
+# Required. 64-char hex (32 bytes) for AES-256-GCM wallet-secret encryption.
+# Generate: openssl rand -hex 32
+ENCRYPTION_KEY=
+
+# Required. Admin dashboard auth. ADMIN_PASSWORD is the login password;
+# JWT_SECRET (>= 32 chars) signs HMAC session tokens.
+ADMIN_PASSWORD=
+JWT_SECRET=
+ADMIN_SESSION_TTL_HOURS=12
+
+# WhatsApp Business Cloud API
+WHATSAPP_TOKEN=your_whatsapp_token_here
+WHATSAPP_PHONE_NUMBER_ID=your_phone_id_here
+WHATSAPP_VERIFY_TOKEN=your_verify_token
+# Required in production. Verifies the X-Hub-Signature-256 header.
+WHATSAPP_APP_SECRET=
+
+# Per-user transfer guardrails (XLM)
+MAX_SEND_AMOUNT=1000
+DAILY_SEND_LIMIT=5000
+MAX_SENDS_PER_DAY=50
+
+# Rate limiting (Mongo-backed, shared across instances)
+RATE_LIMIT_WINDOW_MIN=15
+RATE_LIMIT_MAX=100
+BOT_RATE_WINDOW_SEC=60
+BOT_RATE_MAX=20
+
+# Stellar
+STELLAR_NETWORK=testnet
+STELLAR_HORIZON_URL=https://horizon-testnet.stellar.org
+
+# Optional: expose the unauthenticated REST wallet API (off in prod by default)
+ENABLE_WALLET_REST_API=false
+```
+
+`ENCRYPTION_KEY` must be a 64-character hexadecimal string because the app uses **AES-256-GCM** (authenticated encryption) for Stellar secret keys. Generate one with:
+
+```bash
+openssl rand -hex 32
+# or: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+## Running Locally
+
+From the repository root:
+
+```bash
+npm install
+npm run prisma:generate --workspace=apps/api
+npm run prisma:deploy --workspace=apps/api
+npm run dev --workspace=apps/api
+```
+
+For local schema changes during development:
+
+```bash
+npm run prisma:migrate --workspace=apps/api
+```
+
+## Important Gaps
+
+This refactor adds production module boundaries, Prisma/PostgreSQL persistence, and provider adapters, but real-money launch still needs final provider onboarding, contract deployment, worker deployment, automated tests, monitoring, admin RBAC, and compliance approval — including real per-user authentication for the compliance PIN and KYC-start endpoints, which are gated off in production for now (see below).
+
+The backend runs on `http://localhost:3002`.
+
+## Testing
+
+Unit tests (crypto, admin auth, validators) run on the built-in Node test runner — no extra dependencies:
+
+```bash
+npm test                         # from apps/api
+npm run test --workspace=apps/api  # from the repo root
+```
+
+Quick syntax check on a file you changed:
+
+```bash
+node --check src/app.js
+```
+
+## Testing The REST API
+
+> Requires `ENABLE_WALLET_REST_API=true` (default outside production).
+
+Create a wallet:
+
+```bash
+curl -X POST http://localhost:3002/api/wallet/create \
+  -H "Content-Type: application/json" \
+  -d '{"phoneNumber":"+2348000000000"}'
+```
+
+Check balance:
+
+```bash
+curl http://localhost:3002/api/wallet/+2348000000000/balance
+```
+
+Send a payment:
+
+```bash
+curl -X POST http://localhost:3002/api/wallet/send \
+  -H "Content-Type: application/json" \
+  -d '{"phoneNumber":"+2348000000000","amount":"5","destination":"GDESTINATIONSTELLARADDRESS"}'
+```
+
+## Testing WhatsApp Webhooks Locally
+
+1. Start the backend on port `3002`.
+2. Expose the backend with `ngrok` or `localtunnel`.
+3. Configure the WhatsApp Business webhook URL as `https://your-public-url/webhook`.
+4. Set the same verify token in WhatsApp and `WHATSAPP_VERIFY_TOKEN`.
+5. Set `WHATSAPP_APP_SECRET` to your Meta app secret so POST signatures verify (in development, an unset secret is allowed with a warning; in production unsigned POSTs are rejected).
+6. Send a WhatsApp message to the configured business number.
+
+## Security Posture
+
+Already in place:
+
+- Real admin authentication with HMAC-signed, expiring session tokens; the API refuses to start without `ADMIN_PASSWORD` and `JWT_SECRET`.
+- Admin API routes protected by the `requireAdmin` middleware; login endpoint rate-limited.
+- WhatsApp webhook POSTs verified against `X-Hub-Signature-256` (fail-closed in production).
+- Inbound message idempotency to prevent duplicate transfers from webhook retries.
+- KYC tiers with daily/single-transaction limits and risk scoring, enforced on every payment via the Payment Orchestrator.
+- CORS allowlist enforced in production; PostgreSQL-backed shared rate limiting.
+- The unauthenticated REST wallet API, and the equally unauthenticated `POST /api/compliance/pin` / `POST /api/compliance/kyc/start`, are all disabled in production by default (`ENABLE_WALLET_REST_API`).
+
+## Security and Production Requirements
+
+Before a real-money launch, this backend still needs:
+
+- Real per-user authentication for `POST /api/compliance/pin` and `POST /api/compliance/kyc/start` — they currently accept any phone number with no identity check, so they're kept behind the production flag rather than actually fixed; no user can self-serve a PIN or start KYC in production until this is built.
+- Managed secret/key management (KMS/HSM) for provider credentials, with key rotation.
+- Audit-log coverage for all sensitive admin and compliance actions, plus monitoring and alerting.
+- Replacement of the single shared admin password with real admin accounts and roles.
+- Broader automated test coverage (payment orchestrator, wallet, webhook, voice, and compliance flows).
+- Legal, compliance, KYC, AML, and custody review where required.
+
+## Current Limitations
+
+- Simple WhatsApp command/intent parsing (regex-based).
+- Single shared admin password (no per-admin accounts or roles yet).
+- REST wallet API, compliance PIN, and KYC-start endpoints are unauthenticated by design and disabled in production by default (see above) — no working production path until real per-user auth exists.
+- No customer web login/signup — WhatsApp phone number is the identity.
+- Stellar corridor execution is stubbed pending provider/custody onboarding.
+
+## Testing without WhatsApp
+
+You can test the conversational assistant locally without a WhatsApp number by using the built-in chat simulator.
+
+### 1. Configure the environment
+
+Set the following environment variables in `apps/api/.env`:
+
+```env
+MESSAGE_TRANSPORT=sim
+ENABLE_CHAT_SIM=true
+```
+
+- `MESSAGE_TRANSPORT=sim` stores outbound bot messages in the simulator instead of sending them to the WhatsApp Cloud API.
+- `ENABLE_CHAT_SIM=true` enables the simulator endpoints.
+
+### 2. Start the API
+
+```bash
+npm install
+npm run prisma:generate --workspace=apps/api
+npm run prisma:deploy --workspace=apps/api
+npm run dev --workspace=apps/api
+```
+
+### 3. Send a message
+
+```bash
+curl -X POST http://localhost:3002/api/sim/message \
+  -H "Content-Type: application/json" \
+  -d '{
+    "phoneNumber":"+2348000000001",
+    "name":"Ada",
+    "text":"balance"
+  }'
+```
+
+Example response:
+
+```json
+{
+  "replies": ["Your Telex balances: ..."]
+}
+```
+
+### 4. Fetch the conversation
+
+```bash
+curl http://localhost:3002/api/sim/messages/+2348000000001
+```
+
+Example response:
+
+```json
+{
+  "messages": [
+    {
+      "direction": "in",
+      "text": "balance",
+      "createdAt": "2026-01-01T12:00:00.000Z"
+    },
+    {
+      "direction": "out",
+      "text": "Your Telex balances: ...",
+      "createdAt": "2026-01-01T12:00:01.000Z"
+    }
+  ]
+}
+```
+
+## Telegram transport
+
+Telex can run its bot on Telegram instead of WhatsApp. Set
+`MESSAGE_TRANSPORT=telegram` and the same conversation, payment and voice
+pipeline serves Telegram chats; `meta` continues to work unchanged, so the two
+can be switched between without a migration.
+
+### Identity
+
+Telegram addresses people by a numeric `chat_id` and never volunteers a phone
+number, but everything in Telex — wallets, recipient resolution, pending
+claims, KYC — is keyed on an E.164 phone number. Onboarding therefore opens with
+a **Share phone number** keyboard button, and Telegram returns a verified number
+in a `contact` object. That pair is stored in `TelegramLink`, the single place
+the two namespaces meet.
+
+A link is only written when `contact.user_id` matches the sender, so a forwarded
+third-party contact card cannot bind someone else's number to your chat. Until a
+chat is linked, no message from it is enqueued.
+
+### Setup
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) and copy the token.
+2. Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET` (32+ random characters)
+   and `TELEGRAM_CALLBACK_URL` (must be HTTPS and end in `/webhook/telegram`).
+3. Register the webhook:
+
+   ```bash
+   node scripts/configure-telegram-webhook.js
+   ```
+
+   `--info` prints the current registration and Telegram's last delivery error;
+   `--delete` unregisters it.
+
+### How it differs from the Meta transport
+
+| | Meta | Telegram |
+|---|---|---|
+| Authenticity | `X-Hub-Signature-256`, an HMAC over the body | `X-Telegram-Bot-Api-Secret-Token`, a static shared secret |
+| Delivery receipts | sent / delivered / read callbacks | none — `sent` is terminal |
+| Proactive messages | blocked after 24h without an approved template | always allowed |
+| Voice media | Graph API media URL | `getFile` then the file host |
+
+The secret token is a bearer credential rather than a body signature: anyone who
+observes one request can replay forged updates. The webhook therefore refuses
+plaintext transport in production, and the token supports comma-separated values
+so it can be rotated the same way `WHATSAPP_APP_SECRET` is.
+
+Because Telegram sends no delivery callbacks, `WhatsappStatusEvent` and the
+delivery-status pipeline stay idle on this transport — a Telegram notification
+settles at `sent` and never advances to `delivered` or `read`.

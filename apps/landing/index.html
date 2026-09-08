@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#1878a6" />
+
+    <title>Telex | Send money like you send a text</title>
+    <meta
+      name="description"
+      content="Telex turns Telegram into a Stellar wallet. Create an account, check your balance, and send XLM, all from a chat, no app required."
+    />
+
+    <!-- Open Graph -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Telex" />
+    <meta property="og:title" content="Telex | Send money like you send a text" />
+    <meta
+      property="og:description"
+      content="Telegram-first payments powered by the Stellar network. Create a wallet and send XLM from a chat."
+    />
+    <meta property="og:image" content="/logo-sent.svg" />
+
+    <!-- Twitter -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Telex | Send money like you send a text" />
+    <meta
+      name="twitter:description"
+      content="Telegram-first payments powered by the Stellar network. Create a wallet and send XLM from a chat."
+    />
+    <meta name="twitter:image" content="/logo-sent.svg" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <!-- Applied before first paint so a dark-mode visitor never sees a white
+         flash. Deliberately inline and dependency-free: any deferred module
+         would run after the browser has already painted. Mirrors the logic in
+         src/lib/theme.js; keep the two in step. -->
+    <script>
+      (function () {
+        try {
+          var stored = localStorage.getItem('telex-theme');
+          var dark =
+            stored === 'dark' ||
+            ((stored === null || stored === 'system') &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches);
+          document.documentElement.classList.toggle('dark', dark);
+          document.documentElement.style.colorScheme = dark ? 'dark' : 'light';
+          var meta = document.querySelector('meta[name="theme-color"]');
+          if (meta) meta.setAttribute('content', dark ? '#0b1220' : '#1878a6');
+        } catch (e) {
+          /* Storage or matchMedia unavailable: fall through to light. */
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

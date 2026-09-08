@@ -1,0 +1,12 @@
+{
+  "name": "@telex/shared",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared UI and utilities for the Telex web apps",
+  "peerDependencies": {
+    "react": ">=18",
+    "axios": "^1",
+    "lucide-react": "*"
+  }
+}

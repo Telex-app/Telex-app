@@ -1,0 +1,67 @@
+const { PrismaClient } = require('@prisma/client');
+const { PrismaPg } = require('@prisma/adapter-pg');
+const { Pool } = require('pg');
+const config = require('../config/env');
+const { increment, observeDuration, setGauge } = require('../observability/metrics');
+
+const dbUrl = config.databaseUrl || process.env.DATABASE_URL || 'postgresql://user:pass@localhost:5432/telex_dev';
+
+if (!dbUrl) {
+  throw new Error('DATABASE_URL must be set. Use your Neon PostgreSQL connection string.');
+}
+
+const poolConfig = config.databasePool || {};
+
+const pool = new Pool({
+  connectionString: dbUrl,
+  ssl: config.databaseCa ? { ca: config.databaseCa, rejectUnauthorized: true } : undefined,
+  max: poolConfig.max || 10,
+  connectionTimeoutMillis: poolConfig.connectionTimeoutMs || 5000,
+  idleTimeoutMillis: poolConfig.poolTimeoutMs || 10000,
+});
+pool.on('error', (error) => increment('telex_database_pool_errors_total', { message: error.message }));
+pool.on('acquire', () => setGauge('telex_database_pool_waiting', pool.waitingCount));
+const connectFromPool = pool.connect.bind(pool);
+pool.connect = (...args) => {
+  if (typeof args[0] === 'function') {
+    return connectFromPool(...args);
+  }
+  const started = process.hrtime.bigint();
+  let expired = false;
+  const connection = connectFromPool(...args);
+  if (connection && typeof connection.then === 'function') {
+    connection.then((client) => {
+      if (expired) client.release();
+    }).catch(() => {});
+    let timeoutHandle;
+    const timeout = new Promise((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        expired = true;
+        increment('telex_database_pool_timeouts_total');
+        reject(new Error('Database pool wait timed out'));
+      }, poolConfig.poolTimeoutMs || 10000);
+    });
+    return Promise.race([connection, timeout]).finally(() => {
+      clearTimeout(timeoutHandle);
+      observeDuration(
+        'telex_database_pool_wait_seconds',
+        {},
+        Number(process.hrtime.bigint() - started) / 1e9,
+      );
+    });
+  }
+  return connection;
+};
+
+const adapter = new PrismaPg(pool, { disposeExternalPool: true });
+
+const updatePoolMetrics = () => {
+  setGauge('telex_database_pool_total', pool.totalCount);
+  setGauge('telex_database_pool_idle', pool.idleCount);
+  setGauge('telex_database_pool_waiting', pool.waitingCount);
+};
+setInterval(updatePoolMetrics, 1000).unref();
+
+const prisma = new PrismaClient({ adapter });
+
+module.exports = prisma;

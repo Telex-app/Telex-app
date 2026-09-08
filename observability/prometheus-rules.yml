@@ -1,0 +1,199 @@
+groups:
+  - name: telex-production
+    rules:
+      - alert: TelexApiDown
+        expr: up{job="telex-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: telex-api
+        annotations:
+          summary: Telex API metrics target is down
+
+      - alert: TelexWorkerDown
+        expr: absent(up{job="telex-worker"}) or up{job="telex-worker"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: telex-worker
+        annotations:
+          summary: No Telex worker metrics target is reachable
+
+      - alert: TelexWorkerNotReady
+        expr: telex_worker_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: telex-worker
+        annotations:
+          summary: A Telex worker has lost Redis, database, processor, or heartbeat readiness
+
+      - alert: TelexWorkerHeartbeatStale
+        expr: time() - telex_worker_last_heartbeat_timestamp_seconds > 90
+        for: 1m
+        labels:
+          severity: critical
+          service: telex-worker
+        annotations:
+          summary: A Telex worker heartbeat is stale
+
+      - alert: TelexQueueLagHigh
+        expr: max by (queue) (telex_queue_oldest_job_age_seconds) > 120
+        for: 5m
+        labels:
+          severity: critical
+          service: telex-worker
+        annotations:
+          summary: A Telex queue has been waiting for more than two minutes
+
+      - alert: TelexQueueStalled
+        expr: sum by (queue) (increase(telex_queue_stalled_jobs_total[10m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+          service: telex-worker
+        annotations:
+          summary: BullMQ reported a stalled Telex job
+
+      - alert: TelexDepositSweepStale
+        expr: telex_deposit_sweep_age_seconds < 0 or telex_deposit_sweep_age_seconds > 120
+        for: 3m
+        labels:
+          severity: critical
+          service: telex-worker
+        annotations:
+          summary: The deposit sweep has not completed successfully
+
+      - alert: TelexHighHttpErrorRate
+        expr: |
+          sum(rate(telex_http_requests_total{status_code=~"5.."}[5m]))
+          /
+          clamp_min(sum(rate(telex_http_requests_total[5m])), 0.001)
+          > 0.05
+        for: 10m
+        labels:
+          severity: critical
+          service: telex-api
+        annotations:
+          summary: Telex HTTP 5xx rate exceeds 5%
+
+      - alert: TelexHighLatency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(telex_http_request_duration_seconds_bucket[10m]))
+          ) > 2
+        for: 10m
+        labels:
+          severity: warning
+          service: telex-api
+        annotations:
+          summary: Telex p95 HTTP latency exceeds 2 seconds
+
+      - alert: TelexUnhandledExceptions
+        expr: sum(increase(telex_exceptions_total[5m])) > 2
+        for: 1m
+        labels:
+          severity: critical
+          service: telex-api
+        annotations:
+          summary: Telex is reporting repeated exceptions
+
+      - alert: TelexQueueFailures
+        expr: sum(increase(telex_queue_jobs_total{status="failed"}[10m])) > 5
+        for: 5m
+        labels:
+          severity: critical
+          service: telex-worker
+        annotations:
+          summary: Telex background jobs are repeatedly failing
+
+      - alert: TelexDatabaseHealthDegraded
+        expr: increase(telex_health_checks_total{status="degraded"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          service: telex-api
+        annotations:
+          summary: Telex database health checks are failing
+
+      - alert: TelexRedisDisconnected
+        expr: telex_redis_status == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: telex-redis
+        annotations:
+          summary: Telex Redis is disconnected and work is being queued/buffered
+
+      - alert: TelexRedisRecovery
+        expr: increase(telex_redis_disconnect_recovered_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: info
+          service: telex-redis
+        annotations:
+          summary: Telex Redis has recovered after an outage
+
+      - alert: TelexRedisFailover
+        expr: increase(telex_redis_failovers_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: telex-redis
+        annotations:
+          summary: Telex Redis failed over to a new master node
+
+      - alert: TelexRedisRetriesExhausted
+        expr: increase(telex_redis_retries_exhausted_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          service: telex-redis
+        annotations:
+          summary: Telex Redis reconnect budget exhausted; ensure Redis is reachable
+
+      - alert: TelexQueueInlineFallback
+        expr: increase(telex_queue_inline_fallback_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: telex-api
+        annotations:
+          summary: Telex jobs are running inline instead of durably queued (Redis unavailable)
+
+      - alert: TelexQueueBacklogWarning
+        expr: sum by (queue) (telex_queue_backlog_size) > 50
+        for: 5m
+        labels:
+          severity: warning
+          service: telex-worker
+        annotations:
+          summary: Telex queue {{ $labels.queue }} backlog exceeds 50 jobs
+
+      - alert: TelexQueueBacklogCritical
+        expr: sum by (queue) (telex_queue_backlog_size) > 200
+        for: 2m
+        labels:
+          severity: critical
+          service: telex-worker
+        annotations:
+          summary: Telex queue {{ $labels.queue }} backlog exceeds critical threshold (200 jobs)
+
+      - alert: TelexQueueJobLagHigh
+        expr: sum by (queue) (telex_queue_lag_seconds) > 300
+        for: 5m
+        labels:
+          severity: warning
+          service: telex-worker
+        annotations:
+          summary: Telex queue {{ $labels.queue }} oldest job processing lag exceeds 5 minutes
+
+      - alert: TelexDeadLetterQueueGrowing
+        expr: sum(increase(telex_dlq_moves_total[5m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+          service: telex-worker
+        annotations:
+          summary: Telex dead-letter queue is receiving failed poison message jobs

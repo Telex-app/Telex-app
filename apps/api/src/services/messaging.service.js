@@ -1,0 +1,819 @@
+const axios = require('axios');
+const { randomUUID } = require('node:crypto');
+const config = require('../config/env');
+const logger = require('../utils/logger');
+const prisma = require('../common/prisma');
+const { enqueue } = require('../queues/queue.service');
+const { increment } = require('../observability/metrics');
+
+const RETRYABLE_META_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
+
+const isRetryableMetaFailure = (error) => {
+  const status = Number(error?.response?.status || error?.status || 0);
+  if (RETRYABLE_META_STATUS_CODES.has(status)) return true;
+  const haystack = `${error?.message || ''} ${JSON.stringify(error?.response?.data || {})}`.toLowerCase();
+  return /(timeout|temporar|rate limit|too many|throttl|network|unavailable|busy)/i.test(haystack);
+};
+
+const deliverMetaTextMessage = async (to, body, axiosImpl = axios) => {
+  const url = `https://graph.facebook.com/v19.0/${config.whatsapp.phoneNumberId}/messages`;
+  const payload = {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to,
+    type: 'text',
+    text: {
+      preview_url: false,
+      body,
+    },
+  };
+
+  const response = await axiosImpl.post(url, payload, {
+    headers: {
+      Authorization: `Bearer ${config.whatsapp.token}`,
+      'Content-Type': 'application/json',
+    },
+  });
+
+  return response.data;
+};
+
+const persistOutboundNotification = async ({ to, body, prismaClient = prisma, error = null, retryable = false }) => {
+  const notificationClient = prismaClient.notification;
+  if (!notificationClient?.create) return null;
+
+  const created = await notificationClient.create({
+    data: {
+      userId: null,
+      channel: 'whatsapp',
+      type: 'outbound_message',
+      recipient: to,
+      body,
+      status: retryable ? 'queued' : 'failed',
+      error: error ? String(error.message || error.response?.data || error) : null,
+      metadata: {
+        retryable,
+        errorCode: error?.response?.data?.error?.code || error?.response?.data?.error?.error_subcode || null,
+        retryCount: 0,
+      },
+    },
+  });
+
+  if (retryable) {
+    await enqueue('whatsapp-outbound-retry', 'notification.retry', {
+      notificationId: created.id,
+      to,
+      body,
+      attempts: 0,
+    });
+  }
+
+  return created;
+};
+
+const retryOutboundNotification = async ({ notificationId, to, body, attempts = 0, axiosImpl = axios, prismaClient = prisma }) => {
+  const notification = await prismaClient.notification.findUnique({ where: { id: notificationId } });
+  if (!notification) return { status: 'missing' };
+
+  if (['failed', 'dead_letter', 'sent'].includes(notification.status)) {
+    return { status: notification.status, notification };
+  }
+
+  try {
+    const response = await deliverMetaTextMessage(to, body, axiosImpl);
+    const providerMessageId = response?.messages?.[0]?.id || response?.message_id || null;
+
+    await prismaClient.notification.update({
+      where: { id: notificationId },
+      data: {
+        status: 'sent',
+        providerMessageId,
+        metadata: {
+          ...(notification.metadata || {}),
+          lastAttemptAt: new Date().toISOString(),
+          retryCount: Number(attempts || 0),
+        },
+      },
+    });
+
+    return { status: 'sent', notificationId, providerMessageId };
+  } catch (error) {
+    const retryable = isRetryableMetaFailure(error);
+    const nextAttempts = attempts + 1;
+    const isTerminal = nextAttempts >= 4;
+
+    await prismaClient.notification.update({
+      where: { id: notificationId },
+      data: {
+        status: isTerminal ? 'dead_letter' : 'queued',
+        error: String(error.message || error.response?.data || error),
+        metadata: {
+          ...(notification.metadata || {}),
+          retryable,
+          lastAttemptAt: new Date().toISOString(),
+          retryCount: nextAttempts,
+          lastError: String(error.message || error.response?.data || error),
+        },
+      },
+    });
+
+    if (retryable && !isTerminal) {
+      await enqueue('whatsapp-outbound-retry', 'notification.retry', {
+        notificationId,
+        to,
+        body,
+        attempts: nextAttempts,
+      }, {
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 15000 },
+      });
+    }
+
+    return { status: isTerminal ? 'dead_letter' : 'queued', notificationId, retryable };
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Delivery status state machine (#159)
+//
+// Meta's WhatsApp Cloud API webhook reports status callbacks out of band from
+// the synchronous send response: sent -> delivered -> read, or a terminal
+// failed. STATUS_RANK lets us reject a callback that would regress an
+// already-more-advanced Notification (e.g. a late "sent" arriving after
+// "delivered" was already recorded), and lets "failed" always win as
+// terminal.
+// ---------------------------------------------------------------------------
+const STATUS_RANK = { sent: 1, delivered: 2, read: 3, failed: 4 };
+const MAX_OUTBOUND_RETRIES = 2;
+const activeSendControllers = new Set();
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const waitForRetry = async (ms, sleepImpl, signal) => {
+  if (signal.aborted) return;
+  let onAbort;
+  await Promise.race([
+    sleepImpl(ms),
+    new Promise((resolve) => {
+      onAbort = resolve;
+      signal.addEventListener('abort', resolve, { once: true });
+    }),
+  ]);
+  signal.removeEventListener('abort', onAbort);
+};
+
+const cancelInFlightSends = (reason = 'shutdown') => {
+  for (const controller of activeSendControllers) controller.abort({ type: 'shutdown', message: reason });
+  return activeSendControllers.size;
+};
+
+const errorDetails = (error, kind) => ({
+  kind,
+  status: error.response?.status || null,
+  code: error.code || null,
+  message: String(error.response?.data?.error?.message || error.message || kind).slice(0, 500),
+});
+
+const classifySynchronousFailure = (error, signal) => {
+  if (signal.aborted) {
+    const cancelled = ['shutdown', 'caller'].includes(signal.reason?.type);
+    return { outcome: 'unknown', retryable: false, error: errorDetails(error, cancelled ? 'cancelled' : 'timeout') };
+  }
+  const status = error.response?.status;
+  if (status === 429 || status >= 500) {
+    return { outcome: 'transient_failure', retryable: true, error: errorDetails(error, 'http') };
+  }
+  if (status >= 400 && status < 500) {
+    return { outcome: 'permanent_failure', retryable: false, error: errorDetails(error, 'http') };
+  }
+  if (['ECONNABORTED', 'ETIMEDOUT'].includes(error.code)) {
+    return { outcome: 'unknown', retryable: false, error: errorDetails(error, 'timeout') };
+  }
+  if (['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ENETUNREACH'].includes(error.code)) {
+    return { outcome: 'transient_failure', retryable: true, error: errorDetails(error, 'network') };
+  }
+  return { outcome: 'unknown', retryable: false, error: errorDetails(error, 'network') };
+};
+
+// Meta error codes seen on `statuses[].errors[].code`. Only failures known to
+// be transient (rate limiting, temporary delivery problems) are retried.
+// Anything about a blocked/opted-out recipient, an invalid number, or a
+// closed messaging window is permanent and must never be retried
+// automatically — retrying those just repeats the same rejection.
+const RETRYABLE_ERROR_CODES = new Set([
+  '131026', // Message undeliverable (transient — device/network issue)
+  '131049', // Delivery delayed by Meta's per-recipient limits
+  '130429', // Rate limit hit
+  '131000', // Generic/unknown temporary failure
+]);
+const NON_RETRYABLE_ERROR_CODES = new Set([
+  '131047', // Re-engagement: outside the 24h customer service window
+  '131021', // Recipient cannot be a business / invalid recipient
+  '131031', // Account has been restricted
+  '368',    // Business account temporarily/permanently disabled
+  '470',    // Message failed to send because of a policy violation
+  '131052', // Media download failed
+  '131053', // Media upload failed
+]);
+
+/**
+ * Classify a Meta failure error code as safe to retry or not.
+ * Unknown codes default to non-retryable — retrying a failure we cannot
+ * classify risks looping on a permanent rejection.
+ */
+const classifyWhatsappFailure = (errorCode) => {
+  const code = errorCode == null ? null : String(errorCode);
+  if (code && RETRYABLE_ERROR_CODES.has(code)) return { retryable: true, reason: 'transient' };
+  if (code && NON_RETRYABLE_ERROR_CODES.has(code)) return { retryable: false, reason: 'permanent' };
+  return { retryable: false, reason: 'unknown' };
+};
+
+const CONVERSATION_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+const isWithinConversationWindow = (lastCustomerInteractionAt) => {
+  if (!lastCustomerInteractionAt) return false;
+  const lastTime = new Date(lastCustomerInteractionAt).getTime();
+  if (Number.isNaN(lastTime)) return false;
+  return Date.now() - lastTime <= CONVERSATION_WINDOW_MS;
+};
+
+const sendTemplateMessage = async (to, templateName, languageCode = 'en', components = [], options = {}) => {
+  const {
+    messageTransport = config.messageTransport,
+    prisma: prismaClient = null,
+    axiosImpl = axios,
+    notification = null,
+  } = options;
+
+  const db = notification ? (prismaClient || prisma || require('../common/prisma')) : null;
+
+  try {
+    if (messageTransport === 'sim') {
+      const simDb = prismaClient || prisma || require('../common/prisma');
+      const result = await simDb.simMessage.create({
+        data: {
+          phoneNumber: to,
+          direction: 'out',
+          text: `[Template: ${templateName}]`,
+        },
+      });
+      if (db && notification) {
+        await recordNotificationCreated(db, notification, { to, body: `[Template: ${templateName}]`, providerMessageId: null, status: 'sent' });
+      }
+      return result;
+    }
+
+    // Telegram has no template concept and no 24-hour window to escape, so a
+    // template send degrades to a plain message. Callers reaching here are
+    // proactive notifications that would simply be delivered on Telegram.
+    if (messageTransport === 'telegram') {
+      const telegramService = require('./telegram.service');
+      const linkService = require('../telegram/link.service');
+      const dbClient = prismaClient || prisma || require('../common/prisma');
+      const chatId = await linkService.chatIdForPhone(to, dbClient);
+      if (!chatId) {
+        logger.warn('telegram_template_unlinked_recipient', { to, templateName });
+        return null;
+      }
+      const sent = await telegramService.sendMessage(chatId, `[${templateName}]`, { axiosImpl });
+      if (db && notification) {
+        await recordNotificationCreated(db, notification, {
+          to,
+          body: `[Template: ${templateName}]`,
+          providerMessageId: sent.providerMessageId || null,
+          status: sent.outcome === 'accepted' ? 'sent' : 'failed',
+        });
+      }
+      return sent.outcome === 'accepted' ? { messages: [{ id: sent.providerMessageId }] } : null;
+    }
+
+    const url = `https://graph.facebook.com/v19.0/${config.whatsapp.phoneNumberId}/messages`;
+
+    const payload = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: to,
+      type: 'template',
+      template: {
+        name: templateName,
+        language: { code: languageCode },
+        ...(components && components.length ? { components } : {}),
+      },
+    };
+
+    const response = await axiosImpl.post(url, payload, {
+      headers: {
+        'Authorization': `Bearer ${config.whatsapp.token}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (db && notification) {
+      const providerMessageId = response.data?.messages?.[0]?.id || null;
+      await recordNotificationCreated(db, notification, {
+        to,
+        body: `[Template: ${templateName}]`,
+        providerMessageId,
+        status: providerMessageId ? 'sent' : 'queued',
+      });
+    }
+
+    return response.data;
+  } catch (error) {
+    logger.error('WhatsApp Template API Error:', error.response?.data || error.message);
+    if (db && notification) {
+      await recordNotificationCreated(db, notification, {
+        to,
+        body: `[Template: ${templateName}]`,
+        providerMessageId: null,
+        status: 'failed',
+        error: String(error.response?.data?.error?.message || error.message || 'template send failed').slice(0, 500),
+      });
+    }
+    return null;
+  }
+};
+
+/**
+ * @typedef {'accepted'|'transient_failure'|'permanent_failure'|'unknown'} SendOutcome
+ * @typedef {{outcome: SendOutcome, correlationId: string, attempts: number,
+ *   providerMessageId?: string, retryable?: boolean, data?: object,
+ *   error?: {kind: string, status: number|null, code: string|null, message: string}}} SendResult
+ */
+
+/** @returns {Promise<SendResult>} */
+const sendTextMessage = async (to, body, options = {}) => {
+  const {
+    messageTransport = config.messageTransport,
+    prisma: prismaClient = null,
+    axiosImpl = axios,
+    notification = null,
+    enforceWindow = false,
+    lastCustomerInteractionAt = null,
+    templateName = null,
+    templateLanguage = 'en',
+    templateComponents = [],
+    signal: callerSignal = null,
+    correlationId: providedCorrelationId = null,
+    sleepImpl = sleep,
+  } = options;
+  const { getContext } = require('../observability/context');
+  const outbox = require('./notificationOutbox.service');
+  const correlationId = providedCorrelationId
+    || getContext().correlationId
+    || (notification?.referenceType && notification?.referenceId
+      ? `${notification.referenceType}:${notification.referenceId}`
+      : randomUUID());
+
+  // Meta 24-hour Customer Service Window Enforcement (#190). Telegram imposes no
+  // such window — a bot may message any chat that has ever started it — so the
+  // check is skipped rather than forcing a pointless template path.
+  if (messageTransport !== 'telegram'
+    && enforceWindow && !isWithinConversationWindow(lastCustomerInteractionAt)) {
+    if (templateName) {
+      const data = await sendTemplateMessage(to, templateName, templateLanguage, templateComponents, options);
+      const providerMessageId = data?.messages?.[0]?.id || null;
+      return { outcome: data ? 'accepted' : 'unknown', providerMessageId, correlationId, attempts: 1, data };
+    }
+    logger.warn('whatsapp_window_expired', { to, lastCustomerInteractionAt });
+    const db = notification ? (prismaClient || prisma || require('../common/prisma')) : null;
+    if (db && notification) {
+      await recordNotificationCreated(db, notification, {
+        to,
+        body,
+        providerMessageId: null,
+        status: 'failed',
+        error: 'Meta customer service window expired (24h). Approved template required.',
+      });
+    }
+    return {
+      outcome: 'permanent_failure', retryable: false, correlationId, attempts: 1,
+      error: { kind: 'conversation_window', status: null, code: null, message: 'Meta customer service window expired (24h). Approved template required.' },
+    };
+  }
+
+  // Notification recording is opt-in: callers that care about delivery
+  // lifecycle (financial receipts, deposit alerts, voice replies) pass
+  // `notification`; low-stakes replies (menus, throttle warnings) don't pay
+  // the write. Only touch prisma when there's something to record.
+  const db = notification ? (prismaClient || prisma || require('../common/prisma')) : null;
+
+  // #286: the durable intent is written *before* the provider is called, so a
+  // crash after Meta accepts but before we record still leaves a row to
+  // reconcile. `reserved` is null only when persistence failed for a
+  // notification that does not require durability; for those that do,
+  // reserveOutboundNotification throws and the send does not happen.
+  let reserved = null;
+  if (db && notification && outbox.requiresDurableRecord(notification)) {
+    reserved = await outbox.reserveOutboundNotification(db, { notification, to, body });
+
+    if (reserved) {
+      // An earlier attempt already carried this send to a terminal state;
+      // re-sending would duplicate it.
+      if (reserved.status === outbox.STATUS.SENT) return null;
+
+      const claimed = await outbox.claimForSend(db, reserved.id);
+      if (!claimed) {
+        // Another attempt owns this send, or it is already resolved.
+        logger.warn('whatsapp_send_not_claimed', { notificationId: reserved.id, status: reserved.status });
+        return null;
+      }
+    }
+  }
+
+  if (messageTransport === 'sim') {
+    try {
+      const simDb = prismaClient || prisma || require('../common/prisma');
+      const result = await simDb.simMessage.create({
+        data: {
+          phoneNumber: to,
+          direction: 'out',
+          text: body,
+        },
+      });
+      if (reserved) {
+        await outbox.attachProviderResult(db, reserved.id, { providerMessageId: null, status: 'sent' });
+      } else if (db && notification) {
+        await recordNotificationCreated(db, notification, { to, body, providerMessageId: null, status: 'sent' });
+      }
+      return { outcome: 'accepted', providerMessageId: null, correlationId, attempts: 1, data: result };
+    } catch (error) {
+      return { outcome: 'permanent_failure', retryable: false, correlationId, attempts: 1, error: errorDetails(error, 'storage') };
+    }
+  }
+
+  // Telegram transport. Callers address people by phone number everywhere in
+  // this codebase, so the number is resolved to a chat id here rather than
+  // pushing Telegram's addressing model outwards. An unlinked number is a
+  // permanent failure, not a retry: no amount of redelivery produces a chat id,
+  // only the user tapping "Share phone number" does.
+  if (messageTransport === 'telegram') {
+    const telegramService = require('./telegram.service');
+    const linkService = require('../telegram/link.service');
+    const dbClient = prismaClient || prisma || require('../common/prisma');
+
+    const chatId = await linkService.chatIdForPhone(to, dbClient);
+    if (!chatId) {
+      const message = 'No Telegram chat is linked to this phone number.';
+      logger.warn('telegram_send_unlinked_recipient', { to, correlationId });
+      if (reserved) {
+        await outbox.markSendFailed(db, reserved.id, message);
+      } else if (db && notification) {
+        await recordNotificationCreated(db, notification, {
+          to, body, providerMessageId: null, status: 'failed', error: message,
+        });
+      }
+      return {
+        outcome: 'permanent_failure', retryable: false, correlationId, attempts: 1,
+        error: { kind: 'unlinked_recipient', status: null, code: null, message },
+      };
+    }
+
+    let result;
+    const maxTelegramAttempts = Math.max(1, Number(config.telegram.maxSendRetries || 0) + 1);
+    for (let attempt = 1; attempt <= maxTelegramAttempts; attempt += 1) {
+      result = await telegramService.sendMessage(chatId, body, { axiosImpl, signal: callerSignal });
+      result.attempts = attempt;
+      if (result.outcome === 'accepted' || !result.retryable || attempt === maxTelegramAttempts) break;
+      await sleepImpl(config.telegram.retryBaseDelayMs * (2 ** (attempt - 1)));
+    }
+
+    const providerMessageId = result.providerMessageId || null;
+    if (reserved) {
+      if (result.outcome === 'accepted') {
+        // Telegram has no delivery or read callbacks, so 'sent' is terminal
+        // here — nothing will ever arrive to advance it further.
+        await outbox.attachProviderResult(db, reserved.id, { providerMessageId, status: 'sent' });
+      } else if (result.outcome === 'permanent_failure') {
+        await outbox.markSendFailed(db, reserved.id, String(result.error?.message || 'send failed').slice(0, 500));
+      } else {
+        await outbox.markUnresolved(db, reserved.id, String(result.error?.message || 'no provider response').slice(0, 500));
+      }
+    } else if (db && notification) {
+      await recordNotificationCreated(db, notification, {
+        to,
+        body,
+        providerMessageId,
+        status: result.outcome === 'accepted' ? 'sent' : (result.outcome === 'unknown' ? 'unknown' : 'failed'),
+        error: result.error?.message || null,
+      });
+    }
+
+    if (result.outcome !== 'accepted') {
+      logger.error('telegram_send_failed', { correlationId, ...result.error, attempts: result.attempts });
+    }
+
+    return { ...result, correlationId };
+  }
+
+  const url = `https://graph.facebook.com/${config.whatsapp.graphApiVersion || 'v19.0'}/${config.whatsapp.phoneNumberId}/messages`;
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to,
+    type: 'text',
+    text: { preview_url: false, body },
+    biz_opaque_callback_data: String(correlationId).slice(0, 512),
+  };
+
+  const controller = new AbortController();
+  activeSendControllers.add(controller);
+  const onCallerAbort = () => controller.abort({ type: 'caller', message: 'caller cancelled' });
+  callerSignal?.addEventListener('abort', onCallerAbort, { once: true });
+  if (callerSignal?.aborted) onCallerAbort();
+  const connectDeadline = setTimeout(
+    () => controller.abort({ type: 'timeout', message: 'connection deadline exceeded' }),
+    config.whatsapp.connectTimeoutMs,
+  );
+
+  let finalResult;
+  const maxAttempts = Math.max(1, Number(config.whatsapp.maxSendRetries || 0) + 1);
+  try {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const { outboundHeaders } = require('../observability/context');
+        const response = await axiosImpl.post(url, payload, {
+          headers: {
+            'Authorization': `Bearer ${config.whatsapp.token}`,
+            'Content-Type': 'application/json',
+            ...outboundHeaders(),
+          },
+          timeout: config.whatsapp.responseTimeoutMs,
+          signal: controller.signal,
+        });
+        const providerMessageId = response.data?.messages?.[0]?.id;
+        finalResult = providerMessageId && typeof providerMessageId === 'string'
+          ? { outcome: 'accepted', providerMessageId, correlationId, attempts: attempt, data: response.data }
+          : {
+            outcome: 'unknown', retryable: false, correlationId, attempts: attempt,
+            error: { kind: 'malformed_response', status: response.status || 200, code: null, message: 'Meta response did not contain a message id' },
+          };
+        break;
+      } catch (error) {
+        const classified = classifySynchronousFailure(error, controller.signal);
+        finalResult = { ...classified, correlationId, attempts: attempt };
+        if (!classified.retryable || attempt === maxAttempts) break;
+        const retryAfterSeconds = Number(error.response?.headers?.['retry-after']);
+        const delay = Number.isFinite(retryAfterSeconds)
+          ? retryAfterSeconds * 1000
+          : config.whatsapp.retryBaseDelayMs * (2 ** (attempt - 1));
+        await waitForRetry(delay, sleepImpl, controller.signal);
+        if (controller.signal.aborted) {
+          finalResult = {
+            outcome: 'unknown', retryable: false, correlationId, attempts: attempt,
+            error: errorDetails(new Error('send cancelled'), controller.signal.reason?.type === 'timeout' ? 'timeout' : 'cancelled'),
+          };
+          break;
+        }
+      }
+    }
+  } finally {
+    clearTimeout(connectDeadline);
+    callerSignal?.removeEventListener('abort', onCallerAbort);
+    activeSendControllers.delete(controller);
+  }
+
+  const providerMessageId = finalResult.providerMessageId || null;
+  if (reserved) {
+    if (finalResult.outcome === 'accepted') {
+      await outbox.attachProviderResult(db, reserved.id, {
+        providerMessageId,
+        status: providerMessageId ? 'sent' : 'queued',
+      });
+    } else {
+      const reason = String(finalResult.error?.message || 'send failed').slice(0, 500);
+      if (finalResult.outcome === 'permanent_failure') {
+        await outbox.markSendFailed(db, reserved.id, reason);
+      } else {
+        await outbox.markUnresolved(db, reserved.id, `no provider response: ${reason}`);
+      }
+    }
+  } else if (db && notification) {
+    const status = finalResult.outcome === 'accepted'
+      ? 'queued'
+      : (finalResult.outcome === 'unknown' ? 'unknown' : 'failed');
+    await recordNotificationCreated(db, notification, {
+      to,
+      body,
+      providerMessageId,
+      status,
+      error: finalResult.error?.message || null,
+    });
+  }
+
+  if (finalResult.outcome !== 'accepted') {
+    logger.error('whatsapp_send_failed', { correlationId, ...finalResult.error, attempts: finalResult.attempts });
+    if (finalResult.outcome === 'transient_failure' || finalResult.retryable) {
+      const dbClient = prismaClient || (options.prisma !== undefined ? options.prisma : (prisma || require('../common/prisma')));
+      await persistOutboundNotification({
+        to,
+        body,
+        prismaClient: dbClient,
+        error: finalResult.error?.message || finalResult.error,
+        retryable: true,
+      });
+      return null;
+    }
+  }
+
+  return finalResult;
+};
+
+/**
+ * Persist the outbound side of a WhatsApp send as a Notification row. Kept
+ * as a thin insert (no upsert-by-provider-id) so `sendTextMessage` stays a
+ * simple fire-and-record boundary — the status webhook path
+ * (`recordDeliveryStatus`) is what finds this row again later by
+ * `providerMessageId` and advances it through the delivery lifecycle.
+ */
+const recordNotificationCreated = async (db, notification, { to, body, providerMessageId, status, error = null }) => {
+  try {
+    await db.notification.create({
+      data: {
+        userId: notification.userId || null,
+        channel: notification.channel || 'whatsapp',
+        type: notification.type || 'generic',
+        recipient: to,
+        body,
+        status,
+        providerMessageId,
+        error,
+        referenceType: notification.referenceType || null,
+        referenceId: notification.referenceId || null,
+        sentAt: status === 'sent' ? new Date() : null,
+        failedAt: status === 'failed' ? new Date() : null,
+        lastStatusAt: new Date(),
+      },
+    });
+  } catch (dbError) {
+    // Never let notification bookkeeping break the send path.
+    logger.error('notification_create_failed', { message: dbError.message });
+  }
+};
+
+/**
+ * Record one Meta status callback entry (`value.statuses[i]` from the
+ * webhook payload) idempotently and advance the matching Notification's
+ * delivery lifecycle. Returns a `{ result }` outcome for observability —
+ * callers should treat every outcome as a successful (200-worthy) parse,
+ * even 'malformed'/'unmatched': Meta retries the webhook on non-2xx, and a
+ * bad payload retried forever would just create a retry storm.
+ *
+ * Outcomes:
+ *  - malformed:        payload shape/status/timestamp didn't parse — ignored
+ *  - duplicate:        exact (id, status, timestamp) already recorded
+ *  - unmatched:        valid status, but no Notification has this provider id
+ *  - stale/out_of_order: a status that would regress an already-advanced row
+ *  - terminal_ignored: the Notification already reached a terminal 'failed'
+ *  - recorded:         Notification updated (and, if applicable, a bounded
+ *                       retry was enqueued for a safe terminal failure)
+ */
+const recordDeliveryStatus = async (statusEntry, options = {}) => {
+  const { prisma = null, enqueueImpl = null } = options;
+  const db = prisma || require('../common/prisma');
+
+  const providerMessageId = statusEntry?.id;
+  const status = statusEntry?.status;
+  const timestampRaw = statusEntry?.timestamp;
+
+  if (!providerMessageId || typeof status !== 'string' || !STATUS_RANK[status] || timestampRaw == null) {
+    increment('telex_whatsapp_status_webhook_total', { result: 'malformed' });
+    logger.warn('whatsapp_status_malformed', { statusEntry });
+    return { result: 'malformed' };
+  }
+
+  const statusTimestamp = new Date(Number(timestampRaw) * 1000);
+  if (Number.isNaN(statusTimestamp.getTime())) {
+    increment('telex_whatsapp_status_webhook_total', { result: 'malformed' });
+    logger.warn('whatsapp_status_malformed', { statusEntry, reason: 'bad_timestamp' });
+    return { result: 'malformed' };
+  }
+
+  const errorEntry = Array.isArray(statusEntry.errors) ? statusEntry.errors[0] : null;
+  const errorCode = errorEntry?.code != null ? String(errorEntry.code) : null;
+  const errorTitle = errorEntry?.title ? String(errorEntry.title).slice(0, 200) : null;
+  const errorMessage = errorEntry?.message ? String(errorEntry.message).slice(0, 500) : null;
+
+  try {
+    await db.whatsappStatusEvent.create({
+      data: {
+        providerMessageId,
+        status,
+        statusTimestamp,
+        recipientId: statusEntry.recipient_id || null,
+        errorCode,
+        errorTitle,
+        errorMessage,
+      },
+    });
+  } catch (err) {
+    if (err.code === 'P2002') {
+      increment('telex_whatsapp_status_webhook_total', { result: 'duplicate' });
+      return { result: 'duplicate' };
+    }
+    throw err;
+  }
+
+  increment('telex_whatsapp_delivery_status_total', { status });
+
+  const record = await db.notification.findFirst({ where: { providerMessageId } });
+  if (!record) {
+    increment('telex_whatsapp_status_webhook_total', { result: 'unmatched' });
+    logger.info('whatsapp_status_unmatched', { providerMessageId, status });
+    return { result: 'unmatched' };
+  }
+
+  if (record.status === 'failed') {
+    increment('telex_whatsapp_status_webhook_total', { result: 'terminal_ignored' });
+    return { result: 'terminal_ignored' };
+  }
+
+  if (record.lastStatusAt && statusTimestamp < record.lastStatusAt) {
+    increment('telex_whatsapp_status_webhook_total', { result: 'out_of_order' });
+    return { result: 'out_of_order' };
+  }
+
+  const currentRank = STATUS_RANK[record.status] || 0;
+  const incomingRank = STATUS_RANK[status];
+  if (incomingRank < currentRank) {
+    increment('telex_whatsapp_status_webhook_total', { result: 'out_of_order' });
+    return { result: 'out_of_order' };
+  }
+
+  const data = { status, lastStatusAt: statusTimestamp };
+  if (status === 'sent') data.sentAt = statusTimestamp;
+  if (status === 'delivered') data.deliveredAt = statusTimestamp;
+  if (status === 'read') data.readAt = statusTimestamp;
+
+  let shouldRetry = false;
+  if (status === 'failed') {
+    data.failedAt = statusTimestamp;
+    data.failureCode = errorCode;
+    data.failureMessage = errorMessage || errorTitle || null;
+    const classification = classifyWhatsappFailure(errorCode);
+    data.retryable = classification.retryable;
+    // Retry policy: only for safe/transient terminal failures, only on
+    // messages tied to a domain reference (financial/transaction, voice
+    // command, etc. — see referenceType/referenceId on Notification), and
+    // bounded so a permanently-failing recipient can never loop forever.
+    if (classification.retryable && (record.retryCount || 0) < MAX_OUTBOUND_RETRIES && record.referenceType) {
+      data.retryCount = (record.retryCount || 0) + 1;
+      shouldRetry = true;
+    }
+  }
+
+  await db.notification.update({ where: { id: record.id }, data });
+  increment('telex_whatsapp_status_webhook_total', { result: 'recorded' });
+
+  if (shouldRetry) {
+    try {
+      const enqueue = enqueueImpl || require('../queues/queue.service').enqueue;
+      await enqueue('whatsapp-outbound-retry', 'notification.retry', {
+        originalNotificationId: record.id,
+        recipient: record.recipient,
+        body: record.body,
+        userId: record.userId,
+        type: record.type,
+        channel: record.channel,
+        referenceType: record.referenceType,
+        referenceId: record.referenceId,
+      }, { jobId: `whatsapp-retry-${record.id}-${data.retryCount}` });
+      increment('telex_whatsapp_retry_total', { result: 'enqueued' });
+    } catch (enqueueError) {
+      logger.error('whatsapp_retry_enqueue_failed', { message: enqueueError.message, notificationId: record.id });
+      increment('telex_whatsapp_retry_total', { result: 'enqueue_failed' });
+    }
+  }
+
+  return { result: 'recorded', notificationId: record.id, retried: shouldRetry };
+};
+
+// Best-effort customer data deletion at the messaging provider (Meta Platform
+// data-deletion request). Gated behind an operator-configured deletion URL; when
+// unconfigured it throws ProviderSkippedError so the privacy workflow records a
+// visible "skipped" task rather than a failure.
+const deleteUserData = async (phoneNumber) => {
+  const url = config.whatsapp.dataDeletionUrl || process.env.WHATSAPP_DATA_DELETION_URL;
+  if (!url) throw new ProviderSkippedError('WhatsApp data deletion not configured');
+  await axios.post(url, {
+    user_id: phoneNumber,
+    app_id: config.whatsapp.appId || process.env.WHATSAPP_APP_ID,
+  }, { timeout: 30000, headers: { 'content-type': 'application/json', ...outboundHeaders() } });
+  return { status: 'success' };
+};
+
+module.exports = {
+  sendTextMessage,
+  sendTemplateMessage,
+  retryOutboundNotification,
+  isRetryableMetaFailure,
+  isWithinConversationWindow,
+  CONVERSATION_WINDOW_MS,
+  recordDeliveryStatus,
+  classifyWhatsappFailure,
+  deleteUserData,
+  STATUS_RANK,
+  cancelInFlightSends,
+  classifySynchronousFailure,
+};
