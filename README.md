@@ -1,8 +1,15 @@
-# Telex
+<p align="center">
+  <img src="apps/landing/public/logo-sent.svg" alt="Telex" width="100" />
+</p>
 
-**Send money like you send a text.** Telex gives a phone number a Stellar wallet and drives it from a chat conversation, so people can be paid on the number their contacts already have for them.
+<h1 align="center">Telex</h1>
 
-No app to install, no seed phrase, no wallet address. A user types `send 25000 to 08012345678` or records a voice note, confirms with a PIN, and the payment settles on Stellar.
+<p align="center">
+  <strong>Send money like you send a text.</strong><br/>
+  Telex gives a phone number a Stellar wallet and drives it from a chat conversation,<br/>so people can be paid on the number their contacts already have for them.
+</p>
+
+No app to install, no seed phrase, no wallet address. Type your intent, confirm with a PIN, and the payment settles on Stellar.
 
 > **Status: pre-production.** The architecture, compliance model and transport layer are built and tested. Real money movement still needs provider credentials, a KYC integration, monitoring, and compliance review. See [Before a real-money launch](#before-a-real-money-launch).
 
