@@ -92,7 +92,7 @@ const startServer = async () => {
   };
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGNIT', () => shutdown('SIGINT'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 };
 
 startServer().catch(async (error) => {

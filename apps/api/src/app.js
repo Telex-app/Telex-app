@@ -22,8 +22,11 @@ const config = require('./config/env');
 const { getTrustProxySetting, sanitizeForwardingHeaders } = require('./config/proxy');
 const logger = require('./utils/logger');
 const prisma = require('./common/prisma');
-const { correlationMiddleware } = require('./observability/context');
+const { correlationMiddleware, getContext } = require('./observability/context');
 const { requestMetrics, getMetricSnapshot, metricsHandler, increment } = require('./observability/metrics');
+const { describeNetworkProfile } = require('./config/networkProfiles');
+const { pingRedis } = require('./queues/queue.service');
+const { AppError } = require('./errors');
 
 const app = express();
 let startupComplete = false;
@@ -98,7 +101,6 @@ app.use((err, req, res, next) => {
 // for production log aggregation. Use the standard Apache 'combined' format in
 // production so hosted log drains get parseable, complete request lines.
 app.use(morgan(config.isProduction ? 'combined' : 'dev'));
-app.use(requestMetrics);
 
 // Body limit breaches are safe and observable.
 app.use((err, req, res, next) => {
@@ -161,10 +163,6 @@ app.get(['/health', '/health/ready'], async (req, res) => {
     logger.error('readiness_check_failed', error);
     res.status(503).json({ status: 'degraded', db: 'unknown', redis: 'unknown', uptime: process.uptime(), correlationId });
   }
-});
-
-app.get('/metrics', (_req, res) => {
-  res.status(200).json(getMetricSnapshot());
 });
 
 // Routes

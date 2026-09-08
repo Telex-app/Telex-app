@@ -1,4 +1,4 @@
-import { configureAxe } from 'jest-axe';
+import { configureAxe } from 'vitest-axe';
 
 // jsdom has no rendering engine, so it can't resolve computed styles —
 // axe's color-contrast check is unreliable there and produces false

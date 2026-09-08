@@ -1,7 +1,7 @@
 import '@testing-library/jest-dom';
 import { afterEach, beforeAll, afterAll, expect } from 'vitest';
 import { cleanup } from '@testing-library/react';
-import { toHaveNoViolations } from 'jest-axe';
+import { toHaveNoViolations } from 'vitest-axe';
 import { server } from './mocks/server';
 
 expect.extend(toHaveNoViolations);
