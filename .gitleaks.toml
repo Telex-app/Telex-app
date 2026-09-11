@@ -21,6 +21,8 @@ paths = [
   "(?i)\\.md$",
   "(?i)apps/api/test/",
   "(?i)apps/api/prisma/seed\\.js$",
+  "(?i)tests/secret-scan/",
+  "(?i)scripts/secret-scan-self-test\\.sh$",
 ]
 regexes = [
   "\\$\\{[A-Z_]+\\}",

@@ -4,7 +4,7 @@ const { Pool } = require('pg');
 const config = require('../config/env');
 const { increment, observeDuration, setGauge } = require('../observability/metrics');
 
-const dbUrl = config.databaseUrl || process.env.DATABASE_URL || 'postgresql://user:pass@localhost:5432/telex_dev';
+const dbUrl = config.databaseUrl || process.env.DATABASE_URL || 'postgresql://localhost:5432/telex_dev';
 
 if (!dbUrl) {
   throw new Error('DATABASE_URL must be set. Use your Neon PostgreSQL connection string.');
